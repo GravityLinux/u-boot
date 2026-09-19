@@ -7,11 +7,15 @@
 #include <dm/uclass-internal.h>
 #include <efi_loader.h>
 #include <env.h>
+#include <fs.h>
+#include <malloc.h>
+#include <mapmem.h>
 #include <lmb.h>
 #include <nvme.h>
 #include <part.h>
 
 #include <asm/armv8/mmu.h>
+#include <asm/cache.h>
 #include <asm/global_data.h>
 #include <asm/io.h>
 #include <asm/system.h>
@@ -1326,11 +1330,72 @@ int board_late_init(void)
 	return 0;
 }
 
+/* Calibration belongs to one radio; never use a board-wide fallback file. */
+static void apple_bluetooth_calibration(void *blob)
+{
+	const char *property = "brcm,taurus-bf-cal-blob";
+	const unsigned char *address;
+	loff_t size, actual;
+	char path[96];
+	char *devpart;
+	void *data;
+	int node, len, ret;
+
+	if (fdt_node_check_compatible(blob, 0, "apple,j773g"))
+		return;
+
+	node = fdt_node_offset_by_compatible(blob, -1, "pci14e4,5f72");
+	if (node < 0 || fdt_getprop(blob, node, property, NULL))
+		return;
+
+	address = fdt_getprop(blob, node, "local-bd-address", &len);
+	/* local-bd-address is little endian, unlike the factory MAC address. */
+	if (!address || len != 6 || (address[5] & 1) ||
+	    !memcmp(address, "\0\0\0\0\0\0", 6)) {
+		printf("Bluetooth: missing or invalid radio address\n");
+		return;
+	}
+	snprintf(path, sizeof(path),
+		 "vendorfw/u-boot/brcm/brcmbt4388-%02x%02x%02x%02x%02x%02x-bf.bin",
+		 address[5], address[4], address[3], address[2], address[1], address[0]);
+
+	devpart = gravity_esp_devpart();
+	if (!*devpart || fs_set_blk_dev("nvme", devpart, FS_TYPE_FAT) ||
+	    fs_size(path, &size)) {
+		printf("Bluetooth: no per-radio beamforming calibration on ESP\n");
+		return;
+	}
+	if (size < 4 || size > SZ_32K) {
+		printf("Bluetooth: invalid beamforming calibration size\n");
+		return;
+	}
+	data = memalign(ARCH_DMA_MINALIGN, ALIGN(size, ARCH_DMA_MINALIGN));
+	if (!data)
+		return;
+	/* fs_size closes the filesystem, so select it again before reading. */
+	if (fs_set_blk_dev("nvme", devpart, FS_TYPE_FAT) ||
+	    fs_read(path, map_to_sysmem(data), 0, size, &actual) ||
+	    actual != size || memcmp(data, "BLOB", 4)) {
+		printf("Bluetooth: cannot read valid beamforming calibration\n");
+		goto out;
+	}
+	ret = fdt_setprop(blob, node, property, data, size);
+	if (ret)
+		printf("Bluetooth: cannot add calibration to DT: %s\n", fdt_strerror(ret));
+	else
+		printf("Bluetooth: loaded %lld bytes of per-radio beamforming calibration\n",
+		       (long long)size);
+out:
+	free(data);
+}
+
 int ft_board_setup(void *blob, struct bd_info *bd)
 {
 	struct udevice *dev;
 	const char *stdoutname;
 	int node, ret;
+
+	apple_bluetooth_calibration(blob);
 
 	/*
 	 * Modify the "stdout-path" property under "/chosen" to point
